@@ -2,7 +2,6 @@
 # encoding: utf-8
 
 from cStringIO import StringIO
-from threading import Thread, Lock
 from time import time, sleep
 import argparse
 import csv
@@ -16,112 +15,87 @@ import pika
 logger = logging.getLogger(__name__)
 
 
-class Shared(object):
+class Amqp2Pg(object):
 
-    def __init__(self):
+    def __init__(self, args, db, converter):
+        self.args = args
+        self.db = db
+        self.converter = converter
+        self.last_flush = 0
+
         self.messages = []
-        self.last_tag = None
-        self.lock = Lock()
-        self.to_ack = []
-        self.log_time = time()
-        self.log_count = 0
+
+    def main(self):
+        while True:
+            try:
+                self.conn = pika.SelectConnection(pika.ConnectionParameters(
+                    self.args.rq_host, self.args.rq_port, self.args.rq_vhost,
+                    credentials=pika.PlainCredentials(self.args.rq_user, self.args.rq_passwd),
+                ), on_open_callback=lambda conn: conn.channel(on_open_callback=self.on_ch_open))
+                self.conn.ioloop.start()
+            except KeyboardInterrupt:
+                logger.info("Terminating!")
+                break
+            except:
+                logger.error("Restarting main loop in 5 sec...", exc_info=True)
+                sleep(5.)
+
+    def on_ch_open(self, ch):
+
+        self.ch = ch
+
+        if self.args.rq_qos:
+            ch.basic_qos(logger.debug, prefetch_count=self.args.max_size * 2)
+
+        ch.queue_declare(logger.debug, queue=args.queue, durable=True)
+
+        if self.args.rq_bind:
+            exch, routing_key = self.args.rq_bind
+            ch.queue_bind(queue=self.queue, exchange=exch, routing_key=routing_key)
+
+        logger.info("Ready to consume messages!")
+
+        ch.basic_consume(self.on_message, queue=self.args.queue)
+
+        self.periodic_flush()
 
     def on_message(self, ch, frame, header, body):
+        self.messages.append((body, frame.delivery_tag))
+        if len(self.messages) >= self.args.max_size:
+            self.flush()
 
-        t = time()
-        if t - self.log_time > 1.0 and self.log_count:
-            logger.debug("Got %d messages in %d sec", self.log_count, t - self.log_time)
-            self.log_time = t
-            self.log_count = 0
+    def add_timeout(self, delay, cb):
+        self.conn.ioloop.add_timeout(delay, cb)
 
-        with self.lock:
-            self.messages.append((body, frame.delivery_tag))
+    def periodic_flush(self):
+        if self.messages and time() - self.last_flush > self.args.max_wait:
+            self.flush()
+        self.add_timeout(1., self.periodic_flush)
 
-    def kick_acks(self, ch):
-        with self.lock:
-            to_ack, shared.to_ack = shared.to_ack, []
-        for tag in to_ack:
-            ch.basic_ack(delivery_tag=tag, multiple=True)
+    def flush(self):
 
-    def get_all(self):
-        with self.lock:
-            msgs, self.messages = self.messages, []
-        return msgs
+        self.last_flush = time()
+        logger.debug("Having %d messages", len(self.messages))
 
-    def done(self, tag):
-        with self.lock:
-            self.to_ack.append(tag)
-
-
-shared = Shared()
-
-
-def consumer():
-    while True:
-        try:
-
-            def on_ch_open(ch):
-
-                #ch.basic_qos(logger.debug, prefetch_count=args.max_size * 2)
-
-                ch.queue_declare(logger.debug, queue=args.queue, durable=True)
-
-                def kick_acks():
-                    shared.kick_acks(ch)
-                    conn.ioloop.add_timeout(1., kick_acks)
-
-                conn.ioloop.add_timeout(1., kick_acks)
-
-                if args.rq_bind:
-                    exch, routing_key = args.rq_bind
-                    ch.queue_bind(queue=args.queue, exchange=exch, routing_key=routing_key)
-
-                ch.basic_consume(shared.on_message, queue=args.queue)
-
-            conn = pika.SelectConnection(pika.ConnectionParameters(
-                args.rq_host, args.rq_port, args.rq_vhost,
-                credentials=pika.PlainCredentials(args.rq_user, args.rq_passwd),
-            ), on_open_callback=lambda conn: conn.channel(on_open_callback=on_ch_open))
-            conn.ioloop.start()
-        except:
-            logger.error("Consumer thread got unexpected exception:", exc_info=True)
-            conn.close()
-            conn.ioloop.start()
-            sleep(5.)
-
-
-def saver():
-
-    while True:
-
-        t0 = time()
-        msgs = shared.get_all()
-        logger.debug("Got %d messages", len(msgs))
-
-        if msgs:
-
+        while True:
             buf = StringIO()
             w = csv.writer(buf)
+            chunk, self.messages = self.messages[:self.args.max_size], self.messages[self.args.max_size:]
+            columns, data = self.converter.convert_raws([row for row, tag in chunk])
+            w.writerows(data)
+            buf.seek(0)
+            c = db.cursor()
+            c.copy_expert("COPY {table} ({columns}) FROM STDIN CSV".format(
+                table=self.args.table,
+                columns=', '.join(columns),
+            ), buf)
+            c.close()
+            db.commit()
+            logger.info("Wrote %d rows in %.3f sec.", len(data), time() - self.last_flush)
+            self.ch.basic_ack(delivery_tag=tag, multiple=True)
 
-            for i in range(0, len(msgs), args.max_size):
-                chunk = msgs[i:i + args.max_size]
-                columns, data = converter.convert_raws([row for row, tag in chunk])
-                w.writerows(data)
-                buf.seek(0)
-                c = db.cursor()
-                c.copy_expert("COPY {table} ({columns}) FROM STDIN CSV".format(
-                    table=args.table,
-                    columns=', '.join(columns),
-                ), buf)
-                c.close()
-                db.commit()
-                shared.done(chunk[-1][1])
-                logger.info("Wrote %d rows in %.3f sec.", len(data), time() - t0)
-
-        next_time = t0 + 0.5
-        dt = next_time - time()
-        if dt > 0.:
-            sleep(dt)
+            if len(self.messages) < self.args.max_size:
+                break
 
 
 if __name__ == "__main__":
@@ -135,6 +109,8 @@ if __name__ == "__main__":
     parser.add_argument("--queue", required=True, help=u"RabbitMQ queue to consume")
     parser.add_argument("--max-size", default=5000, type=int,
                         help=u"Max messages count to write in single transaction")
+    parser.add_argument("--max-wait", default=1., type=float,
+                        help=u"Max time to wait to flush pending messages")
 
     db_args = parser.add_argument_group("Database", u"Параметры базы данных")
     db_args.add_argument("--db-host", help=u"Хост")
@@ -146,12 +122,12 @@ if __name__ == "__main__":
         u"RabbitMQ",
         u"Параметры подключения к RabbitMQ для отправки сообщений"
     )
-    rq_args.add_argument("--rq-host", default="127.0.0.1",           help=u"RabbitMQ host")
-    rq_args.add_argument("--rq-port", default=5672,                  help=u"RabbitMQ port")
-    rq_args.add_argument("--rq-user", default="guest",               help=u"RabbitMQ user")
-    rq_args.add_argument("--rq-passwd", default="guest",             help=u"RabbitMQ password")
-    rq_args.add_argument("--rq-vhost", default="/",                  help=u"RabbitMQ virtual host")
-
+    rq_args.add_argument("--rq-host", default="127.0.0.1",  help=u"RabbitMQ host")
+    rq_args.add_argument("--rq-port", default=5672,         help=u"RabbitMQ port")
+    rq_args.add_argument("--rq-user", default="guest",      help=u"RabbitMQ user")
+    rq_args.add_argument("--rq-passwd", default="guest",    help=u"RabbitMQ password")
+    rq_args.add_argument("--rq-vhost", default="/",         help=u"RabbitMQ virtual host")
+    rq_args.add_argument("--rq-qos", type=int,              help=u"RabbitMQ use basic_qos")
     rq_args.add_argument("--rq-bind", nargs=2, metavar=('EXCHANGE', 'ROUTING_KEY'),
                          help=u"Bind queue to the specified exchange (optional)")
 
@@ -182,26 +158,16 @@ if __name__ == "__main__":
     else:
         logging.basicConfig(
             format=u'%(asctime)s.%(msecs).3d %(levelname)8s %(module)6s:%(lineno)03d %(message)s',
-            level=log_level, datefmt="%m.%d %H:%M:%S"
+            level=log_level, datefmt="%Y-%m-%d %H:%M:%S"
         )
 
     if args.syslog:
-
-        syslog_level = getattr(logging, args.syslog_level)
-
         syslog_handler = logging.handlers.SysLogHandler((args.syslog, 514))
-        syslog_handler.socket.setblocking(False)
         syslog_handler.setFormatter(logging.Formatter(
             sys.argv[0] + u'[%(process)s]: %(levelname)8s %(module)s:%(lineno)d %(message)s'
         ))
-        syslog_handler.setLevel(syslog_level)
-
+        syslog_handler.setLevel(getattr(logging, args.syslog_level))
         root_logger.addHandler(syslog_handler)
-
-        syslog_logger = logging.getLogger('syslog')
-        syslog_logger.propagate = False
-        syslog_logger.addHandler(syslog_handler)
-        syslog_logger.setLevel(syslog_level)
 
     db = psycopg2.connect(host=args.db_host, port=args.db_port,
                           database=args.database,
@@ -209,11 +175,4 @@ if __name__ == "__main__":
 
     converter = getattr(__import__(args.converters_pkg), args.converter).convert
 
-    consumer_thread = Thread(target=consumer)
-    consumer_thread.daemon = True
-    consumer_thread.start()
-    saver_thread = Thread(target=saver)
-    saver_thread.daemon = True
-    saver_thread.start()
-
-    saver_thread.join()
+    Amqp2Pg(args, db, converter).main()
