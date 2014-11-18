@@ -51,6 +51,10 @@ class Amqp2Pg(object):
                         self.conn.ioloop.start()
                 except:
                     pass
+                try:
+                    self.db.close()
+                except:
+                    pass
                 sleep(5.)
 
     def on_ch_open(self, ch):
