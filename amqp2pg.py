@@ -17,17 +17,23 @@ logger = logging.getLogger(__name__)
 
 class Amqp2Pg(object):
 
-    def __init__(self, args, db, converter):
+    def __init__(self, args):
         self.args = args
-        self.db = db
-        self.converter = converter
+        self.converter = getattr(__import__(args.converters_pkg), args.converter).convert
         self.last_flush = time()
-
         self.messages = []
+
+    def db_connect(self):
+        return psycopg2.connect(
+            host=self.args.db_host, port=self.args.db_port,
+            database=self.args.database,
+            user=self.args.db_user, password=self.args.db_passwd
+        )
 
     def main(self):
         while True:
             try:
+                self.db = self.db_connect()
                 self.conn = pika.SelectConnection(pika.ConnectionParameters(
                     self.args.rq_host, self.args.rq_port, self.args.rq_vhost,
                     credentials=pika.PlainCredentials(self.args.rq_user, self.args.rq_passwd),
@@ -80,17 +86,18 @@ class Amqp2Pg(object):
         while True:
             buf = StringIO()
             w = csv.writer(buf)
-            chunk, self.messages = self.messages[:self.args.max_size], self.messages[self.args.max_size:]
+            chunk = self.messages[:self.args.max_size]
             columns, data = self.converter.convert_raws([row for row, tag in chunk])
             w.writerows(data)
             buf.seek(0)
-            c = db.cursor()
+            c = self.db.cursor()
             c.copy_expert("COPY {table} ({columns}) FROM STDIN CSV".format(
                 table=self.args.table,
                 columns=', '.join(columns),
             ), buf)
             c.close()
-            db.commit()
+            self.db.commit()
+            del self.messages[:self.args.max_size]
             logger.info("Wrote %d rows in %.3f sec.", len(data), time() - self.last_flush)
             self.ch.basic_ack(delivery_tag=tag, multiple=True)
 
@@ -169,10 +176,4 @@ if __name__ == "__main__":
         syslog_handler.setLevel(getattr(logging, args.syslog_level))
         root_logger.addHandler(syslog_handler)
 
-    db = psycopg2.connect(host=args.db_host, port=args.db_port,
-                          database=args.database,
-                          user=args.db_user, password=args.db_passwd)
-
-    converter = getattr(__import__(args.converters_pkg), args.converter).convert
-
-    Amqp2Pg(args, db, converter).main()
+    Amqp2Pg(args).main()
