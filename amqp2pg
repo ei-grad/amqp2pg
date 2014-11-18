@@ -98,34 +98,25 @@ class Amqp2Pg(object):
 
         self.last_flush = time()
 
-        if len(self.messages) > self.args.max_size:
-            logger.info("Having %d messages", len(self.messages))
-        else:
-            logger.debug("Having %d messages", len(self.messages))
-
-        while self.messages:
-            buf = StringIO()
-            w = csv.writer(buf)
-            chunk = self.messages[:self.args.max_size]
-            columns, data = self.converter.convert_raws(
-                # tag is used for basic_ack below!
-                [row for row, tag in chunk]
-            )
-            w.writerows(data)
-            buf.seek(0)
-            c = self.db.cursor()
-            c.copy_expert("COPY {table} ({columns}) FROM STDIN CSV".format(
-                table=self.args.table,
-                columns=', '.join(columns),
-            ), buf)
-            c.close()
-            self.db.commit()
-            del self.messages[:self.args.max_size]
-            self.ch.basic_ack(delivery_tag=tag, multiple=True)
-            logger.info("Wrote %d rows in %.3f sec.", len(data), time() - self.last_flush)
-
-            if (not flush_all) and (len(self.messages) < self.args.max_size):
-                break
+        buf = StringIO()
+        w = csv.writer(buf)
+        chunk = self.messages[:self.args.max_size]
+        columns, data = self.converter.convert_raws(
+            # tag is used for basic_ack below!
+            [row for row, tag in chunk]
+        )
+        w.writerows(data)
+        buf.seek(0)
+        c = self.db.cursor()
+        c.copy_expert("COPY {table} ({columns}) FROM STDIN CSV".format(
+            table=self.args.table,
+            columns=', '.join(columns),
+        ), buf)
+        c.close()
+        self.db.commit()
+        del self.messages[:self.args.max_size]
+        self.ch.basic_ack(delivery_tag=tag, multiple=True)
+        logger.info("Wrote %d rows in %.3f sec.", len(data), time() - self.last_flush)
 
 
 if __name__ == "__main__":
