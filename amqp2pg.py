@@ -44,6 +44,13 @@ class Amqp2Pg(object):
                 break
             except:
                 logger.error("Restarting main loop in 5 sec...", exc_info=True)
+                self.messages = []  # we have to forget all messages from old rabbit connection
+                try:
+                    if not self.conn.is_closed:
+                        self.conn.close()
+                        self.conn.ioloop.start()
+                except:
+                    pass
                 sleep(5.)
 
     def on_ch_open(self, ch):
