@@ -41,6 +41,11 @@ class Amqp2Pg(object):
                 self.conn.ioloop.start()
             except KeyboardInterrupt:
                 logger.info("Terminating!")
+                # rollback in case if got exception in the flush
+                self.db.rollback()
+                self.flush(True)
+                self.conn.close()
+                self.conn.ioloop.start()
                 break
             except:
                 logger.error("Restarting main loop in 5 sec...", exc_info=True)
@@ -89,16 +94,23 @@ class Amqp2Pg(object):
             self.flush()
         self.add_timeout(1., self.periodic_flush)
 
-    def flush(self):
+    def flush(self, flush_all=False):
 
         self.last_flush = time()
-        logger.debug("Having %d messages", len(self.messages))
 
-        while True:
+        if len(self.messages) > self.args.max_size:
+            logger.info("Having %d messages", len(self.messages))
+        else:
+            logger.debug("Having %d messages", len(self.messages))
+
+        while self.messages:
             buf = StringIO()
             w = csv.writer(buf)
             chunk = self.messages[:self.args.max_size]
-            columns, data = self.converter.convert_raws([row for row, tag in chunk])
+            columns, data = self.converter.convert_raws(
+                # tag is used for basic_ack below!
+                [row for row, tag in chunk]
+            )
             w.writerows(data)
             buf.seek(0)
             c = self.db.cursor()
@@ -109,10 +121,10 @@ class Amqp2Pg(object):
             c.close()
             self.db.commit()
             del self.messages[:self.args.max_size]
-            logger.info("Wrote %d rows in %.3f sec.", len(data), time() - self.last_flush)
             self.ch.basic_ack(delivery_tag=tag, multiple=True)
+            logger.info("Wrote %d rows in %.3f sec.", len(data), time() - self.last_flush)
 
-            if len(self.messages) < self.args.max_size:
+            if (not flush_all) and (len(self.messages) < self.args.max_size):
                 break
 
 
