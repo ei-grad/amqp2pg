@@ -21,7 +21,7 @@ class Amqp2Pg(object):
         self.args = args
         self.db = db
         self.converter = converter
-        self.last_flush = 0
+        self.last_flush = time()
 
         self.messages = []
 
