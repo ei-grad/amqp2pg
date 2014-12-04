@@ -73,6 +73,7 @@ class Amqp2Pg(object):
 
         if self.args.rq_bind:
             exch, routing_key = self.args.rq_bind
+            ch.exchange_declare(logger.debug, exchange=exch, durable=True)
             ch.queue_bind(logger.debug, queue=self.args.queue, exchange=exch, routing_key=routing_key)
 
         logger.info("Ready to consume messages!")
