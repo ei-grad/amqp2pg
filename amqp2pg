@@ -126,7 +126,7 @@ class Amqp2Pg(object):
         self.ch.basic_ack(delivery_tag=tag, multiple=True)
 
         logger.info("Wrote %d rows in (all=%.3fs parse2csv=%.3fs copy=%.3fs commit=%.3fs)", len(data),
-                    time() - self.last_flush, t2 - t1, t3 - t2)
+                    time() - self.last_flush, t1 - self.last_flush, t2 - t1, t3 - t2)
 
 
 if __name__ == "__main__":
