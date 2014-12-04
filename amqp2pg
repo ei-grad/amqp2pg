@@ -43,7 +43,7 @@ class Amqp2Pg(object):
                 logger.info("Terminating!")
                 # rollback in case if got exception in the flush
                 self.db.rollback()
-                self.flush(True)
+                self.flush()
                 self.conn.close()
                 self.conn.ioloop.start()
                 break
@@ -94,38 +94,39 @@ class Amqp2Pg(object):
             self.flush()
         self.add_timeout(1., self.periodic_flush)
 
-    def flush(self, flush_all=False):
+    def flush(self):
 
         self.last_flush = time()
 
-        if len(self.messages) > self.args.max_size:
-            logger.info("Having %d messages", len(self.messages))
-        else:
-            logger.debug("Having %d messages", len(self.messages))
+        buf = StringIO()
+        columns, data = self.converter.convert_raws(
+            # tag is used for basic_ack below!
+            [row for row, tag in self.messages]
+        )
+        csv.writer(buf).writerows(data)
+        buf.seek(0)
 
-        while self.messages:
-            buf = StringIO()
-            w = csv.writer(buf)
-            chunk = self.messages[:self.args.max_size]
-            columns, data = self.converter.convert_raws(
-                # tag is used for basic_ack below!
-                [row for row, tag in chunk]
-            )
-            w.writerows(data)
-            buf.seek(0)
-            c = self.db.cursor()
-            c.copy_expert("COPY {table} ({columns}) FROM STDIN CSV".format(
-                table=self.args.table,
-                columns=', '.join(columns),
-            ), buf)
-            c.close()
-            self.db.commit()
-            del self.messages[:self.args.max_size]
-            self.ch.basic_ack(delivery_tag=tag, multiple=True)
-            logger.info("Wrote %d rows in %.3f sec.", len(data), time() - self.last_flush)
+        t1 = time()
 
-            if (not flush_all) and (len(self.messages) < self.args.max_size):
-                break
+        c = self.db.cursor()
+        c.copy_expert("COPY {table} ({columns}) FROM STDIN CSV".format(
+            table=self.args.table,
+            columns=', '.join(columns),
+        ), buf)
+        c.close()
+
+        t2 = time()
+
+        self.db.commit()
+
+        t3 = time()
+
+        self.messages = []
+
+        self.ch.basic_ack(delivery_tag=tag, multiple=True)
+
+        logger.info("Wrote %d rows in (all=%.3fs parse2csv=%.3fs copy=%.3fs commit=%.3fs)", len(data),
+                    time() - self.last_flush, t2 - t1, t3 - t2)
 
 
 if __name__ == "__main__":
